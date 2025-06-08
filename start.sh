@@ -14,8 +14,8 @@ cd /home/app
 
 if [ "$ENVIRONMENT" = "production" ]; then
     echo "Iniciando Angular en modo producción"
-    ng serve --host 0.0.0.0 --port 4200 --configuration production
+    ng serve --host 0.0.0.0 --port 4200 --configuration production --disable-host-check
 else
     echo "Iniciando Angular en modo desarrollo"
-    ng serve --host 0.0.0.0 --port 4200
+    ng serve --host 0.0.0.0 --port 4200 --disable-host-check
 fi
