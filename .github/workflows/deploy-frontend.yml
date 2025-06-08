@@ -1,0 +1,232 @@
+name: Deploy Frontend on PR Merge and Trigger Chart Update
+
+on:
+  pull_request:
+    types:
+      - closed # Se dispara cuando un PR se cierra
+    branches:
+      - master # O main
+      - stage
+      - dev
+  workflow_dispatch: # Permite disparo manual
+    inputs:
+      simulated_pr_title:
+        description: 'Simulated PR Title for Frontend (e.g., "Release v1.2.3")'
+        required: true
+        type: string
+      simulated_target_branch:
+        description: 'Simulated Target Branch for Frontend (master, stage, or dev)'
+        required: true
+        type: choice
+        options:
+          - dev
+          - stage
+          - master # Asegúrate que coincida con tus nombres de rama
+        default: 'master'
+
+permissions:
+  contents: read    # Para hacer checkout del repo
+  id-token: write   # Requerido por aws-actions/configure-aws-credentials
+  pull-requests: read # Para leer el título del PR
+
+env:
+  AWS_REGION: ${{ secrets.TF_REGION }} # Necesitarás este secret en el repo del frontend
+  # ECR_REPOSITORY_NAME se define dinámicamente
+
+jobs:
+  build-push-frontend-and-trigger:
+    runs-on: ubuntu-22.04
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && github.event.pull_request.merged == true)
+
+    steps:
+    - name: Checkout Frontend Repository
+      uses: actions/checkout@v4
+
+    - name: Extract Version and Determine Environment
+      id: set-env-details
+      run: |
+        PR_TITLE=""
+        EFFECTIVE_BRANCH_NAME=""
+        EVENT_TYPE="${{ github.event_name }}"
+
+        echo "Workflow triggered by event: $EVENT_TYPE"
+
+        if [[ "$EVENT_TYPE" == "workflow_dispatch" ]]; then
+          PR_TITLE="${{ github.event.inputs.simulated_pr_title }}"
+          EFFECTIVE_BRANCH_NAME="${{ github.event.inputs.simulated_target_branch }}"
+          echo "Manual dispatch: Simulated PR Title='$PR_TITLE', Target Branch='$EFFECTIVE_BRANCH_NAME'"
+        elif [[ "$EVENT_TYPE" == "pull_request" && "${{ github.event.pull_request.merged }}" == "true" ]]; then
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          EFFECTIVE_BRANCH_NAME="${{ github.base_ref }}"
+          echo "PR Merge: Actual PR Title='$PR_TITLE', Base Branch='$EFFECTIVE_BRANCH_NAME'"
+        else
+          echo "::error::Unexpected event combination. Exiting."
+          exit 1
+        fi
+        
+        IMAGE_VERSION_FROM_PR=$(echo "$PR_TITLE" | sed -n 's/.*\b\(v\?[0-9]\+\.[0-9]\+\.[0-9]\+\)\b.*/\1/p')
+        if [ -z "$IMAGE_VERSION_FROM_PR" ]; then
+          echo "::error::Could not extract semantic version from PR title: '$PR_TITLE'."
+          exit 1
+        fi
+        
+        TARGET_VALUES_FILE="" # En el repo de charts
+        ENVIRONMENT_NAME=""   # dev, stage, prod
+
+        if [[ "$EFFECTIVE_BRANCH_NAME" == "master" || "$EFFECTIVE_BRANCH_NAME" == "main" ]]; then
+          TARGET_VALUES_FILE="values-master.yaml"
+          ENVIRONMENT_NAME="prod"
+        elif [[ "$EFFECTIVE_BRANCH_NAME" == "stage" ]]; then
+          TARGET_VALUES_FILE="values-stage.yaml"
+          ENVIRONMENT_NAME="stage"
+        elif [[ "$EFFECTIVE_BRANCH_NAME" == "dev" ]]; then
+          TARGET_VALUES_FILE="values-dev.yaml"
+          ENVIRONMENT_NAME="dev"
+        else
+          echo "::error::Effective branch '$EFFECTIVE_BRANCH_NAME' is not configured. Exiting."
+          exit 1
+        fi
+        
+        echo "TARGET_VALUES_FILE_ENV=$TARGET_VALUES_FILE" >> $GITHUB_ENV
+        echo "IMAGE_VERSION_ENV=$IMAGE_VERSION_FROM_PR" >> $GITHUB_ENV
+        echo "EFFECTIVE_BRANCH_NAME_ENV=$EFFECTIVE_BRANCH_NAME" >> $GITHUB_ENV
+        echo "ENVIRONMENT_NAME_ENV=$ENVIRONMENT_NAME" >> $GITHUB_ENV
+
+        echo "Target values file (for chart repo): $TARGET_VALUES_FILE"
+        echo "Image Version for ECR Tag: $IMAGE_VERSION_FROM_PR"
+        echo "Environment for ECR Repo: $ENVIRONMENT_NAME"
+
+    - name: Set up AWS credentials
+      id: aws-creds # Necesitarás secrets de AWS en este repo de frontend también
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }} # Opcional
+        aws-region: ${{ env.AWS_REGION }}
+        mask-aws-account-id: 'no'
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+
+    - name: Determine Base ECR Registry URI
+      id: set-ecr-base-uri
+      run: |
+        ECR_URI_FROM_LOGIN="${{ steps.login-ecr.outputs.registry }}"
+        AWS_ACCOUNT_ID_CLI=$(aws sts get-caller-identity --query Account --output text 2>/dev/null || echo "AWS_CLI_FAILED")
+        AWS_REGION_ENV="${{ env.AWS_REGION }}"
+        FINAL_ECR_BASE_URI=""
+        if [ -n "$ECR_URI_FROM_LOGIN" ]; then
+          FINAL_ECR_BASE_URI="$ECR_URI_FROM_LOGIN"
+        elif [ -n "$AWS_ACCOUNT_ID_CLI" ] && [ "$AWS_ACCOUNT_ID_CLI" != "None" ] && [ "$AWS_ACCOUNT_ID_CLI" != "AWS_CLI_FAILED" ] && [ -n "$AWS_REGION_ENV" ]; then
+          FINAL_ECR_BASE_URI="${AWS_ACCOUNT_ID_CLI}.dkr.ecr.${AWS_REGION_ENV}.amazonaws.com"
+        else
+          echo "::error::Could not determine Base ECR Registry URI."
+          exit 1
+        fi
+        echo "ECR_BASE_REGISTRY_URI_ENV=$FINAL_ECR_BASE_URI" >> $GITHUB_ENV
+
+    - name: Build, Tag, and Push Frontend Docker Image
+      env:
+        BASE_ECR_URI: ${{ env.ECR_BASE_REGISTRY_URI_ENV }}
+        ENV_NAME: ${{ env.ENVIRONMENT_NAME_ENV }}
+        IMAGE_TAG: ${{ env.IMAGE_VERSION_ENV }}
+      run: |
+        if [ -z "$BASE_ECR_URI" ] || [ -z "$ENV_NAME" ] || [ -z "$IMAGE_TAG" ]; then
+          echo "::error::Critical environment variables for ECR push are missing."
+          exit 1
+        fi
+        
+        ECR_REPO_NAME_FOR_FRONTEND="frontend-${ENV_NAME}" # e.g., frontend-dev
+        echo "Processing frontend for ECR repo: $ECR_REPO_NAME_FOR_FRONTEND"
+
+        # El Dockerfile está en la raíz del repo del frontend
+        CONTEXT_PATH="." 
+        DOCKERFILE_PATH="./Dockerfile" 
+
+        if [ ! -f "$DOCKERFILE_PATH" ]; then 
+          echo "::error::Dockerfile $DOCKERFILE_PATH not found. Exiting."; 
+          exit 1;
+        fi
+
+        echo "Checking/Creating ECR repository: $ECR_REPO_NAME_FOR_FRONTEND"
+        aws ecr describe-repositories --repository-names "$ECR_REPO_NAME_FOR_FRONTEND" --region "${{ env.AWS_REGION }}" > /dev/null 2>&1 || \
+        aws ecr create-repository \
+          --repository-name "$ECR_REPO_NAME_FOR_FRONTEND" \
+          --region "${{ env.AWS_REGION }}" \
+          --image-tag-mutability MUTABLE \
+          --image-scanning-configuration scanOnPush=true
+        
+        IMAGE_PATH_VERSIONED="$BASE_ECR_URI/$ECR_REPO_NAME_FOR_FRONTEND:$IMAGE_TAG"
+        IMAGE_PATH_LATEST="$BASE_ECR_URI/$ECR_REPO_NAME_FOR_FRONTEND:latest"
+        
+        echo "Building image: $IMAGE_PATH_VERSIONED"
+        docker build -t "$IMAGE_PATH_VERSIONED" -f "$DOCKERFILE_PATH" "$CONTEXT_PATH"
+        echo "Tagging as latest: $IMAGE_PATH_LATEST"
+        docker tag "$IMAGE_PATH_VERSIONED" "$IMAGE_PATH_LATEST"
+        
+        echo "Pushing: $IMAGE_PATH_VERSIONED"
+        docker push "$IMAGE_PATH_VERSIONED"
+        echo "Pushing: $IMAGE_PATH_LATEST"
+        docker push "$IMAGE_PATH_LATEST"
+        echo "Finished processing frontend image."
+
+    - name: Trigger chart repository update for Frontend
+      env:
+        SCRIPT_ECR_BASE_REGISTRY_URI: ${{ env.ECR_BASE_REGISTRY_URI_ENV }}
+        SCRIPT_TARGET_VALUES_FILE: ${{ env.TARGET_VALUES_FILE_ENV }}
+        SCRIPT_EFFECTIVE_BRANCH_NAME: ${{ env.EFFECTIVE_BRANCH_NAME_ENV }}
+        SCRIPT_ENVIRONMENT_NAME: ${{ env.ENVIRONMENT_NAME_ENV }}
+        SCRIPT_IMAGE_VERSION: ${{ env.IMAGE_VERSION_ENV }}
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ secrets.CHARTS_REPO_TOKEN }} # Necesitarás este secret en el repo del frontend
+        script: |
+          const effective_branch_name = process.env.SCRIPT_EFFECTIVE_BRANCH_NAME;
+          const image_version = process.env.SCRIPT_IMAGE_VERSION;
+          const ecr_base_registry_uri = process.env.SCRIPT_ECR_BASE_REGISTRY_URI;
+          const target_values_file_in_chart = process.env.SCRIPT_TARGET_VALUES_FILE;
+          const environment_name_for_ecr = process.env.SCRIPT_ENVIRONMENT_NAME; // e.g. dev, stage, prod
+          const frontend_ecr_repo_name = `frontend-${environment_name_for_ecr}`; // e.g. frontend-dev
+
+          console.log(`Dispatching Frontend Update Event Details:
+            Effective Branch (Triggering): ${effective_branch_name}
+            Image Version (Tag for ECR): ${image_version}
+            Base ECR Registry URI: ${ecr_base_registry_uri}
+            Frontend ECR Repo Name: ${frontend_ecr_repo_name}
+            Target Values File in Chart: ${target_values_file_in_chart}`);
+
+          if (!ecr_base_registry_uri || !target_values_file_in_chart || !image_version || !frontend_ecr_repo_name) {
+            core.setFailed('Critical Error: Key details for frontend dispatch are empty.');
+            return;
+          }
+          
+          await github.rest.repos.createDispatchEvent({
+            owner: 'microservices-project-k8s-jenkins', // Propietario del repo de charts
+            repo: 'ecommerce-chart',                     // Nombre del repo de charts
+            event_type: 'update-frontend-image-tag',     // Nuevo event_type específico
+            client_payload: {
+              effective_branch: effective_branch_name, 
+              image_version_tag: image_version, 
+              frontend_image_repository: `${ecr_base_registry_uri}/${frontend_ecr_repo_name}`, // Repositorio completo del frontend
+              target_values_file: target_values_file_in_chart
+            }
+          });
+          console.log(`Successfully triggered chart update for frontend in ${target_values_file_in_chart} using image version ${image_version}.`);
+
+    - name: Deployment Summary
+      env:
+        SUMMARY_ECR_BASE_URI: ${{ env.ECR_BASE_REGISTRY_URI_ENV }}
+        SUMMARY_IMAGE_VERSION: ${{ env.IMAGE_VERSION_ENV }}
+        SUMMARY_TARGET_VALUES_FILE: ${{ env.TARGET_VALUES_FILE_ENV }}
+        SUMMARY_EFFECTIVE_BRANCH: ${{ env.EFFECTIVE_BRANCH_NAME_ENV }}
+        SUMMARY_ENVIRONMENT_NAME: ${{ env.ENVIRONMENT_NAME_ENV }}
+      run: |
+        echo "## Frontend Deployment Summary for PR Merge to: ${SUMMARY_EFFECTIVE_BRANCH}" >> $GITHUB_STEP_SUMMARY
+        # ... (Adaptar el sumario para el frontend)
+        echo "- **Target Values File Updated in Chart:** ${SUMMARY_TARGET_VALUES_FILE}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Frontend Image Version Pushed:** ${SUMMARY_IMAGE_VERSION}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Frontend ECR Repository:** frontend-${SUMMARY_ENVIRONMENT_NAME}" >> $GITHUB_STEP_SUMMARY
