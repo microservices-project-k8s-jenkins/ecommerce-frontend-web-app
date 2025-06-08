@@ -3,8 +3,7 @@
 API_HOST=${API_HOST:-localhost}
 API_PORT=${API_PORT:-8080}
 ENVIRONMENT=${ENVIRONMENT:-development}
-
-echo "Configurando nginx con API_HOST=$API_HOST, API_PORT=$API_PORT"
+SECRET_TEXT=${SECRET_TEXT:-"not provided"}
 
 envsubst '${API_HOST} ${API_PORT}' < /etc/nginx/nginx.conf.template > /etc/nginx/nginx.conf
 
