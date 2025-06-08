@@ -7,6 +7,8 @@ SECRET_TEXT=${SECRET_TEXT:-"not provided"}
 
 envsubst '${API_HOST} ${API_PORT}' < /etc/nginx/nginx.conf.template > /etc/nginx/nginx.conf
 
+echo "{\"secretText\": \"$SECRET_TEXT\"}" > /home/app/src/assets/config.json
+
 nginx &
 
 cd /home/app

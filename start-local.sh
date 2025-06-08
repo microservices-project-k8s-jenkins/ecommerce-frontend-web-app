@@ -6,4 +6,6 @@ SECRET_TEXT=${SECRET_TEXT:-"not provided"}
 
 mkdir -p src/assets
 
+echo "{\"secretText\": \"$SECRET_TEXT\"}" > src/assets/config.json
+
 npx ng serve --host 0.0.0.0 --port 4200 --disable-host-check
