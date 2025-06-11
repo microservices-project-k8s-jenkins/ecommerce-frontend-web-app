@@ -17,7 +17,7 @@ on:
         type: string
 
 jobs:
-  lint-build-and-test:
+  build-and-test:
     name: Lint, Build, and Test Frontend
     runs-on: ubuntu-latest
 
@@ -50,7 +50,7 @@ jobs:
         run: npm ci
 
       - name: Run Unit Tests
-        run: npm run test:unit
+        run: npm run test
 
       - name: Build for Production (Test Build)
         run: npm run build
