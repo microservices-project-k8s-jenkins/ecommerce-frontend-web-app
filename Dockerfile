@@ -1,21 +1,27 @@
-FROM node:14-alpine
+FROM node:18-alpine
 
 RUN apk add --no-cache nginx gettext bash
-RUN npm i -g npm@8.1.4
-RUN npm i -g @angular/cli@13.0.3
+
+RUN npm install -g pnpm
+
+RUN npm set registry https://registry.npmmirror.com
+
+ENV PNPM_HOME="/root/.local/share/pnpm"
+ENV PATH="${PNPM_HOME}:${PATH}"
+
+RUN mkdir -p $PNPM_HOME && \
+    pnpm add -g @angular/cli@13.3.9
 
 COPY nginx.conf /etc/nginx/nginx.conf.template
 COPY start.sh /start.sh
 RUN chmod +x /start.sh
 
-RUN mkdir -p /home/app
-
-RUN mkdir -p /var/run/nginx
+RUN mkdir -p /home/app /var/run/nginx
 
 WORKDIR /home/app
 
 COPY package*.json ./
-RUN npm i
+RUN pnpm install
 
 COPY src ./src
 COPY angular.json ./
